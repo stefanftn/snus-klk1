@@ -52,3 +52,19 @@ CodeCoverage/
 *.VisualState.xml
 TestResult.xml
 nunit-*.xml
+
+.idea/
+**/.idea/
+**/.idea.*/
+
+bin/
+obj/
+**/bin/
+**/obj/
+
+# Rider
+*.iml
+**/*.iml
+indexLayout.xml
+vcs.xml
+workspace.xml
