@@ -25,10 +25,15 @@ public class ProcessingSystem
 
     public event Action<Job, int>? JobCompleted;
     public event Action<Job>? JobFailed;
+    private readonly EventLogger _logger;
 
-    public ProcessingSystem(SystemConfig config)
+    public ProcessingSystem(SystemConfig config, EventLogger logger)
     {
         _maxQueueSize = config.MaxQueueSize;
+        _logger = logger;
+        
+        JobCompleted += async (job, result) => await _logger.LogCompletedAsync(job, result);
+        JobFailed += async (job) => await _logger.LogFailedAsync(job);
 
         for (int i = 0; i < config.WorkerCount; i++)
             _workers.Add(Task.Run(() => WorkerLoop(_cts.Token)));
@@ -158,10 +163,9 @@ public class ProcessingSystem
         }
     }
 
-    private static Task LogAbortAsync(Job job)
+    private Task LogAbortAsync(Job job)
     {
-        // placeholder
-        return Task.CompletedTask;
+        return _logger.LogAbortAsync(job);
     }
 
     public void Stop()
