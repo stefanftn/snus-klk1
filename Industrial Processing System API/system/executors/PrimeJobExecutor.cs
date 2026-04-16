@@ -1,7 +1,21 @@
-namespace Industrial_Processing_System_API.system;
+using Industrial_Processing_System_API.config;
+using Industrial_Processing_System_API.models;
 
-public class PrimeExecutor
+namespace Industrial_Processing_System_API.system.executors;
+
+public class PrimeJobExecutor : IJobExecutor
 {
+    public JobType JobType => JobType.Prime;
+
+    public Task<int> ExecuteAsync(string payload)
+    {
+        return Task.Run(() =>
+        {
+            var (numbers, threads) = PayloadParser.ParsePrimePayload(payload);
+            return ExecutePrime(numbers, threads);
+        });
+    }
+    
     public static int ExecutePrime(int limit, int threadCount)
     {
         var ranges = Enumerable.Range(0, threadCount)

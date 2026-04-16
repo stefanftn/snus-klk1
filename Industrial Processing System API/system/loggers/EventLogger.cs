@@ -1,8 +1,8 @@
 using Industrial_Processing_System_API.models;
 
-namespace Industrial_Processing_System_API.system;
+namespace Industrial_Processing_System_API.system.loggers;
 
-public class EventLogger(string logPath = "events.log")
+public class EventLogger(string logPath = "events.log") : IEventLogger
 {
     private readonly SemaphoreSlim _fileLock = new(1, 1);
 

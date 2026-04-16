@@ -1,9 +1,9 @@
 using System.Xml.Linq;
 using Industrial_Processing_System_API.models;
 
-namespace Industrial_Processing_System_API.system;
+namespace Industrial_Processing_System_API.system.report_generators;
 
-public class ReportGenerator
+public class ReportGenerator : IReportGenerator
 {
     private readonly string _reportFolder;
     private int _reportIndex = 0;
@@ -15,8 +15,7 @@ public class ReportGenerator
         Directory.CreateDirectory(reportFolder);
     }
 
-    public void GenerateReport(
-        IEnumerable<(Job job, int result, bool failed, TimeSpan duration)> completedJobs)
+    public void GenerateReport(IEnumerable<(Job job, int result, bool failed, TimeSpan duration)> completedJobs)
     {
         var jobList = completedJobs.ToList();
 
