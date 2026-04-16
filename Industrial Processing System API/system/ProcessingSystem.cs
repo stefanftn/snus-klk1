@@ -36,9 +36,13 @@ public class ProcessingSystem
         foreach (var job in config.Jobs)
             Submit(job);
     }
+    
+    private readonly Dictionary<Guid, TaskCompletionSource<int>> _pendingJobs = new();
 
     public JobHandle? Submit(Job job)
     {
+        var tcs = new TaskCompletionSource<int>();
+
         lock (_lock)
         {
             if (_seenIds.Contains(job.Id))
@@ -49,11 +53,12 @@ public class ProcessingSystem
 
             _seenIds.Add(job.Id);
             _queue.Enqueue(job, job.Priority);
+            _pendingJobs[job.Id] = tcs;
         }
 
         _signal.Release();
 
-        return new JobHandle { Id = job.Id, Result = CreateResultTask(job) };
+        return new JobHandle { Id = job.Id, Result = tcs.Task };
     }
 
     private Task<int> CreateResultTask(Job job)
@@ -87,7 +92,73 @@ public class ProcessingSystem
         }
     }
 
-    private Task ProcessJob(Job job)
+    private async Task ProcessJob(Job job)
+    {
+
+        TaskCompletionSource<int>? tcs;
+        lock (_lock)
+        {
+            _pendingJobs.TryGetValue(job.Id, out tcs);
+        }
+
+        if (tcs == null) return;
+
+        for (int attempt = 1; attempt <= Constants.MAX_ATTEMPTS; attempt++)
+        {
+            try
+            {
+                var jobTask = job.Type switch
+                {
+                    JobType.Prime => Task.Run(() =>
+                    {
+                        var (numbers, threads) = ParsePrimePayload(job.Payload);
+                        return PrimeExecutor.ExecutePrime(numbers, threads);
+                    }),
+                    JobType.IO => Task.Run(() =>
+                    {
+                        var delay = ParseIOPayload(job.Payload);
+                        return IOExecutor.ExecuteIO(delay);
+                    }),
+                    _ => throw new InvalidOperationException($"Unknown job type: {job.Type}")
+                };
+
+                // waiting result with timeout
+                var completed = await Task.WhenAny(jobTask, Task.Delay(Constants.TIMEOUT_MS));
+
+                if (completed == jobTask)
+                {
+                    int result = await jobTask;
+                    tcs.SetResult(result);
+                    JobCompleted?.Invoke(job, result);
+                    return;
+                }
+
+                // Timeout — fail
+                JobFailed?.Invoke(job);
+
+                if (attempt == Constants.MAX_ATTEMPTS)
+                {
+                    // ABORT nakon 3 pokušaja
+                    tcs.SetCanceled();
+                    await LogAbortAsync(job);
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                JobFailed?.Invoke(job);
+
+                if (attempt == Constants.MAX_ATTEMPTS)
+                {
+                    tcs.SetException(ex);
+                    await LogAbortAsync(job);
+                    return;
+                }
+            }
+        }
+    }
+
+    private static Task LogAbortAsync(Job job)
     {
         // placeholder
         return Task.CompletedTask;
@@ -96,5 +167,21 @@ public class ProcessingSystem
     public void Stop()
     {
         _cts.Cancel();
+    }
+    
+    private static (int numbers, int threads) ParsePrimePayload(string payload)
+    {
+        // Format: "numbers:10_000,threads:3"
+        var parts = payload.Split(',');
+        int numbers = int.Parse(parts[0].Split(':')[1].Replace("_", ""));
+        int threads = int.Parse(parts[1].Split(':')[1]);
+        threads = Math.Clamp(threads, 1, 8);
+        return (numbers, threads);
+    }
+
+    private static int ParseIOPayload(string payload)
+    {
+        // Format: "delay:1_000"
+        return int.Parse(payload.Split(':')[1].Replace("_", ""));
     }
 }
