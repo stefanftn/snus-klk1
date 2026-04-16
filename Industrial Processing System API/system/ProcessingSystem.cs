@@ -8,8 +8,14 @@ public class ProcessingSystem
     // for priority handling
     private readonly PriorityQueue<Job, int> _queue = new();
     
+    // because we cannot traverse priority queue properly
+    private readonly List<Job> _queueSnapshot = new();
+    
     // for idempotent handling
     private readonly HashSet<Guid> _seenIds = new();
+    
+    // for reports
+    private readonly List<(Job job, int result, bool failed, TimeSpan duration)> _completedJobs = new();
     
     // for thread-safety on queue
     private readonly object _lock = new();
@@ -25,12 +31,16 @@ public class ProcessingSystem
 
     public event Action<Job, int>? JobCompleted;
     public event Action<Job>? JobFailed;
+    
     private readonly EventLogger _logger;
+    private readonly ReportGenerator _reportGenerator;
 
-    public ProcessingSystem(SystemConfig config, EventLogger logger)
+    public ProcessingSystem(SystemConfig config, EventLogger logger, ReportGenerator reportGenerator)
     {
         _maxQueueSize = config.MaxQueueSize;
         _logger = logger;
+        _reportGenerator = reportGenerator;
+        _ = StartReportTimerAsync(_cts.Token);
         
         JobCompleted += async (job, result) => await _logger.LogCompletedAsync(job, result);
         JobFailed += async (job) => await _logger.LogFailedAsync(job);
@@ -58,18 +68,13 @@ public class ProcessingSystem
 
             _seenIds.Add(job.Id);
             _queue.Enqueue(job, job.Priority);
+            _queueSnapshot.Add(job);
             _pendingJobs[job.Id] = tcs;
         }
 
         _signal.Release();
 
         return new JobHandle { Id = job.Id, Result = tcs.Task };
-    }
-
-    private Task<int> CreateResultTask(Job job)
-    {
-        // placeholder
-        return Task.FromResult(0);
     }
 
     private async Task WorkerLoop(CancellationToken token)
@@ -84,7 +89,10 @@ public class ProcessingSystem
                 lock (_lock)
                 {
                     if (_queue.Count > 0)
+                    {
                         job = _queue.Dequeue();
+                        _queueSnapshot.Remove(job);
+                    }
                 }
 
                 if (job != null)
@@ -99,7 +107,8 @@ public class ProcessingSystem
 
     private async Task ProcessJob(Job job)
     {
-
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        
         TaskCompletionSource<int>? tcs;
         lock (_lock)
         {
@@ -133,8 +142,15 @@ public class ProcessingSystem
                 if (completed == jobTask)
                 {
                     int result = await jobTask;
+                    stopwatch.Stop();
                     tcs.SetResult(result);
                     JobCompleted?.Invoke(job, result);
+                    
+                    lock (_lock)
+                    {
+                        _pendingJobs.Remove(job.Id);
+                        _completedJobs.Add((job, result, false, stopwatch.Elapsed));
+                    }
                     return;
                 }
 
@@ -143,9 +159,15 @@ public class ProcessingSystem
 
                 if (attempt == Constants.MAX_ATTEMPTS)
                 {
-                    // ABORT nakon 3 pokušaja
                     tcs.SetCanceled();
+                    stopwatch.Stop();
                     await LogAbortAsync(job);
+                    
+                    lock (_lock)
+                    {
+                        _pendingJobs.Remove(job.Id);
+                        _completedJobs.Add((job, -1, true, stopwatch.Elapsed));
+                    }
                     return;
                 }
             }
@@ -156,7 +178,14 @@ public class ProcessingSystem
                 if (attempt == Constants.MAX_ATTEMPTS)
                 {
                     tcs.SetException(ex);
+                    stopwatch.Stop();
                     await LogAbortAsync(job);
+                    
+                    lock (_lock)
+                    {
+                        _pendingJobs.Remove(job.Id);
+                        _completedJobs.Add((job, -1, true, stopwatch.Elapsed));
+                    }
                     return;
                 }
             }
@@ -171,6 +200,39 @@ public class ProcessingSystem
     public void Stop()
     {
         _cts.Cancel();
+    }
+    
+    public IEnumerable<Job> GetTopJobs(int n)
+    {
+        lock (_lock)
+        {
+            return _queueSnapshot
+                .OrderBy(j => j.Priority)
+                .Take(n)
+                .ToList();
+        }
+    }
+
+    public Job? GetJob(Guid id)
+    {
+        lock (_lock)
+        {
+            return _queueSnapshot.FirstOrDefault(j => j.Id == id);
+        }
+    }
+    
+    private async Task StartReportTimerAsync(CancellationToken token)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromMinutes(Constants.NEW_REPORT_TIMER_MINS));
+        while (await timer.WaitForNextTickAsync(token))
+        {
+            List<(Job, int, bool, TimeSpan)> snapshot;
+            lock (_lock)
+            {
+                snapshot = _completedJobs.ToList();
+            }
+            _reportGenerator.GenerateReport(snapshot);
+        }
     }
     
     private static (int numbers, int threads) ParsePrimePayload(string payload)
