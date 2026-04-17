@@ -1,3 +1,4 @@
+using Industrial_Processing_System_API.config;
 using Industrial_Processing_System_API.models;
 
 namespace Industrial_Processing_System_API.system.executors;
@@ -10,12 +11,12 @@ public class IOJobExecutor : IJobExecutor
     {
         return Task.Run(() =>
         {
-            var delay = int.Parse(payload.Split(':')[1].Replace("_", ""));
+            var delay = PayloadParser.ParseIOPayload(payload);
             return ExecuteIO(delay);
         });
     }
     
-    public static int ExecuteIO(int delayMs)
+    private static int ExecuteIO(int delayMs)
     {
         Thread.Sleep(delayMs);
         return Random.Shared.Next(0, 101);

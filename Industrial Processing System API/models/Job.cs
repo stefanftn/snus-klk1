@@ -6,4 +6,5 @@ public class Job
     public JobType Type { get; set; }
     public string Payload  { get; set; } = string.Empty;
     public int Priority { get; set; }
+    public DateTime SubmittedAt { get; set; } = DateTime.UtcNow;
 }

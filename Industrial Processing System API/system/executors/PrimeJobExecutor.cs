@@ -16,7 +16,7 @@ public class PrimeJobExecutor : IJobExecutor
         });
     }
     
-    public static int ExecutePrime(int limit, int threadCount)
+    private static int ExecutePrime(int limit, int threadCount)
     {
         var ranges = Enumerable.Range(0, threadCount)
             .Select(i =>

@@ -3,12 +3,16 @@ using Industrial_Processing_System_API.models;
 using Industrial_Processing_System_API.system.executors;
 using Industrial_Processing_System_API.system.loggers;
 using Industrial_Processing_System_API.system.report_generators;
+using System.Diagnostics;
+
+namespace Industrial_Processing_System_API.system;
 
 public class ProcessingSystem
 {
     private readonly PriorityQueue<Job, int> _queue = new();
     private readonly List<Job> _queueSnapshot = new();
     private readonly HashSet<Guid> _seenIds = new();
+    private readonly Dictionary<Guid, Job> _allJobs = new();
     private readonly List<(Job job, int result, bool failed, TimeSpan duration)> _completedJobs = new();
     private readonly Dictionary<Guid, TaskCompletionSource<int>> _pendingJobs = new();
     private readonly object _lock = new();
@@ -17,8 +21,8 @@ public class ProcessingSystem
     private readonly int _maxQueueSize;
     private readonly List<Task> _workers = new();
 
-    public event Action<Job, int>? JobCompleted;
-    public event Action<Job>? JobFailed;
+    public event Func<Job, int, Task>? JobCompleted;
+    public event Func<Job, Task>? JobFailed;
 
     private readonly Dictionary<JobType, IJobExecutor> _executors;
     private readonly IEventLogger _logger;
@@ -28,8 +32,7 @@ public class ProcessingSystem
         SystemConfig config,
         IEventLogger logger,
         IReportGenerator reportGenerator,
-        IEnumerable<IJobExecutor> executors
-        )
+        IEnumerable<IJobExecutor> executors)
     {
         _maxQueueSize = config.MaxQueueSize;
         _logger = logger;
@@ -61,6 +64,7 @@ public class ProcessingSystem
             _queue.Enqueue(job, job.Priority);
             _queueSnapshot.Add(job);
             _pendingJobs[job.Id] = tcs;
+            _allJobs[job.Id] = job;
         }
 
         _signal.Release();
@@ -97,8 +101,6 @@ public class ProcessingSystem
 
     private async Task ProcessJob(Job job)
     {
-        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-
         TaskCompletionSource<int>? tcs;
         lock (_lock) { _pendingJobs.TryGetValue(job.Id, out tcs); }
         if (tcs == null) return;
@@ -109,19 +111,40 @@ public class ProcessingSystem
             return;
         }
 
-        for (int attempt = 1; attempt <= Constants.MAX_ATTEMPTS; attempt++)
+        var elapsed = DateTime.UtcNow - job.SubmittedAt;
+        var remainingTime = TimeSpan.FromMilliseconds(Constants.TIMEOUT_MS) - elapsed;
+
+        if (remainingTime <= TimeSpan.Zero)
+        {
+            if (JobFailed != null) await JobFailed.Invoke(job);
+
+            tcs.SetCanceled();
+            await _logger.LogAbortAsync(job);
+
+            lock (_lock)
+            {
+                _pendingJobs.Remove(job.Id);
+                _completedJobs.Add((job, -1, true, TimeSpan.FromMilliseconds(Constants.TIMEOUT_MS)));
+            }
+            return;
+        }
+
+        var stopwatch = Stopwatch.StartNew();
+
+        for (var attempt = 1; attempt <= Constants.MAX_ATTEMPTS; attempt++)
         {
             try
             {
                 var jobTask = executor.ExecuteAsync(job.Payload);
-                var completed = await Task.WhenAny(jobTask, Task.Delay(Constants.TIMEOUT_MS));
+                var completed = await Task.WhenAny(jobTask, Task.Delay(remainingTime));
 
                 if (completed == jobTask)
                 {
                     int result = await jobTask;
                     stopwatch.Stop();
+
                     tcs.SetResult(result);
-                    JobCompleted?.Invoke(job, result);
+                    if (JobCompleted != null) await JobCompleted.Invoke(job, result);
 
                     lock (_lock)
                     {
@@ -131,48 +154,36 @@ public class ProcessingSystem
                     return;
                 }
 
-                JobFailed?.Invoke(job);
+                if (JobFailed != null) await JobFailed.Invoke(job);
+                if (attempt != Constants.MAX_ATTEMPTS) continue;
+                
+                stopwatch.Stop();
+                tcs.SetCanceled();
+                await _logger.LogAbortAsync(job);
 
-                if (attempt == Constants.MAX_ATTEMPTS)
+                lock (_lock)
                 {
-                    tcs.SetCanceled();
-                    stopwatch.Stop();
-                    await _logger.LogAbortAsync(job);
-
-                    lock (_lock)
-                    {
-                        _pendingJobs.Remove(job.Id);
-                        _completedJobs.Add((job, -1, true, stopwatch.Elapsed));
-                    }
-                    return;
+                    _pendingJobs.Remove(job.Id);
+                    _completedJobs.Add((job, -1, true, stopwatch.Elapsed));
                 }
+                return;
             }
             catch (Exception ex)
             {
-                JobFailed?.Invoke(job);
+                if (JobFailed != null) await JobFailed.Invoke(job);
+                if (attempt != Constants.MAX_ATTEMPTS) continue;
+                
+                stopwatch.Stop();
+                tcs.SetException(ex);
+                await _logger.LogAbortAsync(job);
 
-                if (attempt == Constants.MAX_ATTEMPTS)
+                lock (_lock)
                 {
-                    tcs.SetException(ex);
-                    stopwatch.Stop();
-                    await _logger.LogAbortAsync(job);
-
-                    lock (_lock)
-                    {
-                        _pendingJobs.Remove(job.Id);
-                        _completedJobs.Add((job, -1, true, stopwatch.Elapsed));
-                    }
-                    return;
+                    _pendingJobs.Remove(job.Id);
+                    _completedJobs.Add((job, -1, true, stopwatch.Elapsed));
                 }
+                return;
             }
-        }
-    }
-
-    public IEnumerable<Job> GetTopJobs(int n)
-    {
-        lock (_lock)
-        {
-            return _queueSnapshot.OrderBy(j => j.Priority).Take(n).ToList();
         }
     }
 
@@ -180,7 +191,18 @@ public class ProcessingSystem
     {
         lock (_lock)
         {
-            return _queueSnapshot.FirstOrDefault(j => j.Id == id);
+            return _allJobs.GetValueOrDefault(id);
+        }
+    }
+
+    public IEnumerable<Job> GetTopJobs(int n)
+    {
+        lock (_lock)
+        {
+            return _queueSnapshot
+                .OrderBy(j => j.Priority)
+                .Take(n)
+                .ToList();
         }
     }
 
@@ -192,7 +214,11 @@ public class ProcessingSystem
         while (await timer.WaitForNextTickAsync(token))
         {
             List<(Job, int, bool, TimeSpan)> snapshot;
-            lock (_lock) { snapshot = _completedJobs.ToList(); }
+            lock (_lock)
+            {
+                snapshot = _completedJobs.ToList();
+                _completedJobs.Clear();
+            }
             _reportGenerator.GenerateReport(snapshot);
         }
     }

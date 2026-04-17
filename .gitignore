@@ -68,3 +68,5 @@ obj/
 indexLayout.xml
 vcs.xml
 workspace.xml
+*.user
+*.DotSettings.user
